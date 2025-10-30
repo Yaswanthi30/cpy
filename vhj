@@ -1,16 +1,202 @@
-| Source_DB | Source_Table | Source_Field                                 | Target_Table | Business Logic                                                                                                                                                                                                                                                                                                                                                       |
-| --------- | ------------ | -------------------------------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| FILE      | Hierarchy_In | gfcid                                        | LR_File      | The hierarchy is flattened so each child becomes its own row, adjusting parenting so `load_gfcid = child_gfcid` to preserve lineage. Pseudo: `out.load_gfcid := in.agg_hierarchy[index].child_gfcid;` Rows with null `parent_gfcid` are skipped, and valid `gfcid` values are written to the target.                                                                 |
-| FILE      | Hierarchy_In | id_type                                      | LR_File      | Value carried unchanged. Rows without `parent_gfcid` are excluded. Write `id_type` directly to the output.                                                                                                                                                                                                                                                           |
-| FILE      | Hierarchy_In | batch_dt                                     | LR_File      | Field propagated as-is from input to output. Only rows having a valid parent-child link are written.                                                                                                                                                                                                                                                                 |
-| FILE      | Hierarchy_In | client_type                                  | LR_File      | Pass through `client_type`. Filter out records lacking a parent link, then write the value to the output file.                                                                                                                                                                                                                                                       |
-| FILE      | Hierarchy_In | month                                        | LR_File      | Copy `month` without modification. Keep rows that have valid parent references and write to target.                                                                                                                                                                                                                                                                  |
-| FILE      | Hierarchy_In | year                                         | LR_File      | Pass through `year`. Keep only rows linked to valid parents and write to output.                                                                                                                                                                                                                                                                                     |
-| FILE      | Hierarchy_In | country                                      | LR_File      | Pass through `country`. Exclude orphan rows. Write `country` to target.                                                                                                                                                                                                                                                                                              |
-| FILE      | Hierarchy_In | agg_hierarchy[index].agg                     | LR_File      | Flatten the array and handle special parent-child cases: if the last element’s `parent_gfcid` is null and the current index is second-last, take the next element’s value; otherwise take current. Pseudo: `out.agg := if(switch_flag='Y') next.agg else curr.agg;` This ensures a child inherits parent data where needed. Write the resulting `agg` to the target. |
-| FILE      | Hierarchy_In | agg_hierarchy[index].cntry_code              | LR_File      | During flattening, derive `cntry_code` from current hierarchy element, or inherit from the next element in the special parenting case. This propagates the parent’s country code downward. Write only for valid parent-linked rows.                                                                                                                                  |
-| FILE      | Hierarchy_In | agg_hierarchy[index].cntry_appx_id           | LR_File      | Normalize array while preserving parent-child structure; derive `cntry_appx_id` from current or next element depending on `switch_flag`. Ensures consistent appendix identifier inheritance.                                                                                                                                                                         |
-| FILE      | Hierarchy_In | agg_hierarchy[index].country_appx_state      | LR_File      | Flatten array; inherit `country_appx_state` from next element when parent-child adjustment applies. Rows missing parent references are skipped.                                                                                                                                                                                                                      |
-| FILE      | Hierarchy_In | agg_hierarchy[index].country_appx_status     | LR_File      | During normalization, derive `country_appx_status` from current or next hierarchy record depending on `switch_flag`. Keeps consistent parent-child status propagation.                                                                                                                                                                                               |
-| FILE      | Hierarchy_In | agg_hierarchy[index].citi_service_cntry_code | LR_File      | Flatten array with parenting adjustment; assign `citi_service_cntry_code` from next element when `switch_flag='Y'` (UAT fix #28454 applied). This ensures correct service-country propagation down the hierarchy.                                                                                                                                                    |
-| FILE      | Hierarchy_In | switch_flag (derived)                        | LR_File      | Derived during hierarchy flattening: `switch_flag = if(is_null(last.parent_gfcid) and length>1 and index=length-2) 'Y' else 'N'`. Used to decide when a child record inherits parent values during parenting adjustment (`load_gfcid = child_gfcid`). Write for traceability in debugging or audit.                                                                  |
+R_1 – Business Logic (Comprehensive Narrative Version)
+1. Overview
+
+The LR_1 mapping handles the loading of trade hierarchy data from the source file ($LR_FILE) into the target database table TRADE_HIERARCHY_INTF.
+The process applies standard canonicalization, validations, business rules, and transaction control through Ab Initio components — BT, MUT, ET, and Fuse blocks.
+The output files include Reject File, Rej Txn With Error, Unused File, and Log File, each capturing a different record disposition based on transformation outcomes.
+
+2. Parameters Used
+
+TABLE = TRADE_HIERARCHY_INTF
+
+AI_DML = ~$AI_DML/kyc_interface_giw_main_table.dml
+
+AI_SQL = ~$AI_SQL/kyc_interface_giw_TRADE_HIERARCHY_INTF_gbl_insertsql.sql
+
+DBC_FILE = $DBC_FILE (database connection configuration)
+
+COMMIT_TABLE = $COMMIT_TABLE
+
+TRANSACTION_GROUP = GIW_HIERARCHY_LOAD
+
+AB_HOME = $AB_HOME (Ab Initio home path for includes)
+
+All DML includes, SQL paths, and commit tables are parameterized to support flexible environment deployment.
+
+3. Canonicalization and Transformations
+
+Each input field from the source is normalized and validated before processing.
+
+Canonical transformations applied across the mapping include:
+
+normalize(s) → Trims, strips, and truncates string fields to match column size limits.
+
+upper(s) → Converts alphanumeric fields to uppercase for consistency.
+
+code1(s) → Extracts the first character and uppercases it (for flags like Y/N).
+
+code3(s) → Extracts the first three characters and converts to uppercase (for ISO country codes).
+
+num(x) → Converts a valid numeric string to a decimal; returns NULL for invalid values.
+
+dt(x) → Validates and converts date fields to the correct date format.
+
+nz(x,def) → Substitutes a default value if the field is NULL.
+
+is_iso3(s) → Verifies that a field conforms to a valid ISO 3-letter country code format.
+
+4. Pre-Database Validation Rules
+
+Before any record reaches the MUT (Multi Update Table), it passes a sequence of format, consistency, and business validations.
+If any validation fails, the record is rejected immediately (sent to Reject File).
+
+Format and Presence Checks
+
+load_gfcid must not be null or empty; this is a mandatory key field.
+
+Flags (is_aggregator, standalone_fl, is_trnx_rollback) must be either ‘Y’ or ‘N’.
+
+Country fields (agg_country, citi_service_cntry_code, transaction_country) must pass is_iso3() validation.
+
+Date fields (feed_date, act_strt_dt, act_end_dt) must be valid dates.
+
+feed_date must not exceed the current date.
+
+When both act_strt_dt and act_end_dt exist, act_strt_dt ≤ act_end_dt.
+
+Business Rule Validations
+
+Self-parenting protection: Reject if load_gfcid = child_gfcid = parent_gfcid.
+
+Parent-child relationship: Reject if child_gfcid = parent_gfcid.
+
+Effective ownership: Must lie between 0.0 and 100.0.
+
+Hierarchy level: Must be ≥ 0; if is_aggregator='Y' and hierarchy level is NULL, default to 1.
+
+Shard number: Must lie between 0 and 4095. If NULL, auto-derive using mod(hash(upper(load_gfcid)),4096).
+
+Versioning: Default to 1 if missing.
+
+Audit fields:
+
+create_id and lst_upd_id default to 'ETL' if not provided.
+
+create_dt and lst_upd_dt default to the current date.
+
+Records failing any of these validations are routed to the Reject File with an error_message starting with ERR_FORMAT: or ERR_RULE:.
+
+5. Database Update Logic (MUT Component)
+
+After successful pre-validation, each record is passed to the MUT component for database application.
+
+Executes SQL:
+~$AI_SQL/kyc_interface_giw_TRADE_HIERARCHY_INTF_gbl_insertsql.sql
+
+Operation mode: UPSERT (INSERT/UPDATE) into the TRADE_HIERARCHY_INTF table.
+
+SQL applies standard DML updates:
+
+Inserts if record is new.
+
+Updates if a record with the same key exists.
+
+On Insert:
+
+create_dt = SYSDATE
+
+create_id = 'ETL' (if null)
+
+ver_num defaults to 1
+
+On Update:
+
+lst_upd_dt = SYSDATE
+
+lst_upd_id = 'ETL' (if null)
+
+ver_num incremented if data changes.
+
+No-op detection:
+If the existing record matches all fields (no change), record flagged as SKIPPED and routed to Unused File.
+
+6. Error Handling and Reject Construction
+
+DB Errors:
+Any error during SQL execution (constraint, key violation, deadlock, FK failure, etc.) triggers a Rej Txn With Error output.
+The error_message field captures both the Oracle error code and message.
+
+Reject File Construction (Fuse):
+Combines the rejected record payload with an error message string using string('\r\n') terminator.
+Output DML:
+
+record
+  TRADE_HIERARCHY_INTF_type TRADE_HIERARCHY_INTF;
+  string('\r\n') error_message = NULL('');
+end;
+
+
+Fuse-1 Construction:
+Similar transformation but specifically for database-level rejections.
+
+7. Transaction Control
+
+Begin Transaction (BT):
+Opens transaction group GIW_HIERARCHY_LOAD with commit table $COMMIT_TABLE.
+Each record is processed as a separate transaction (transaction_record_count=1).
+
+End Transaction (ET):
+Commits successful transactions and logs counts.
+Reject threshold is Never Abort, ensuring ET continues even if records are rejected.
+
+8. Record Routing and Target Flow
+
+Records are routed to target files depending on the validation and processing outcomes:
+
+Reject File:
+Records rejected during pre-DB validations or transformation errors.
+error_message populated with ERR_FORMAT or ERR_RULE.
+
+Rej Txn With Error:
+Records rejected during database apply due to SQL or constraint errors.
+error_message populated with ERR_DB.
+
+Unused File:
+Records that pass all validations but result in no changes in the database (no rows affected or SKIPPED).
+
+Log File:
+Contains job execution metadata, record counts, start/end times, DB messages, and commit summaries.
+
+9. Key Transformations Summary
+
+String handling: string_strip, string_upper, string_trunc
+
+Numeric conversion: is_valid_decimal, decimal()
+
+Date conversion: is_valid_date, date()
+
+Validation: is_null, length, index, hash, mod
+
+Error control: Conditional reject("ERR_...") logic in pre-transform DML
+
+Routing control: Fuse, Fuse-1, Gather, BT/ET for transaction grouping
+
+10. Output Summary
+
+Reject File: ${TABLE}_type + error_message → Contains invalid data rejected pre-DB.
+
+Rej Txn With Error: ${TABLE}_type + error_message → Contains DB rejection messages.
+
+Unused File: ${TABLE}_type → Records with no DB changes.
+
+Log File: log_info_t → Execution-level metrics, DB counts, timestamps, commit info.
+
+11. Final Flow Logic Summary (Paragraph)
+
+Every record from $LR_FILE undergoes normalization and field-level validation.
+If any field fails a structural, format, or business rule check, it is immediately rejected with a descriptive message (ERR_FORMAT or ERR_RULE).
+Validated records proceed to the database stage via the MUT component.
+Records that fail SQL execution are sent to the Rej Txn With Error file with full database error details.
+Records that do not trigger any insert/update operation are routed to the Unused File, while successful transactions are committed.
+The BT/ET components manage one-record transactions under the group GIW_HIERARCHY_LOAD, ensuring atomicity and reliability.
+Finally, a Log File captures statistics, counts, and runtime metrics for audit and traceability.
