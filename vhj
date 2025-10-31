@@ -1,54 +1,152 @@
-Parameters Used
+1. Objective
 
-${REGION} → Region code passed dynamically (e.g., “M”, “K”, “C”, etc.)
+This graph updates the staging load status for region-filtered records that were rejected in earlier steps.
+It marks the corresponding GFCID entries in multiple summary tables with a uniform status update: “RGN FILTERED OUT” and captures update timestamps, job IDs, and error handling outputs.
 
-${PROCESS_REGION} → Vector or list of allowed region names (used in lookup)
+2. Source: RGN Rejects
 
-Lookup Table: ISO_COUNTRY_LKP – a lookup table containing country-to-region mappings
+Component: RGN Rejects
 
-Fields Used: agg_country, transaction_country, custom_region
+DML: ~$AI_DML/kyc_interface_giw_hierarchy_trade_pup.dml
 
-Select Expression (Filter Condition)
+Fields:
 
-The filter expression used in the Region Filter component is:
+region – string, initialized as NULL('')
 
-(starts_with('${REGION}','M') and agg_country=='MX') or
-(starts_with('${REGION}','K') and agg_country=='KR') or
-(starts_with('${REGION}','C') and transaction_country=='CN') or
-lookup("ISO_COUNTRY_LKP", agg_country).custom_region member [vector ${PROCESS_REGION}]
+tradepup_action – structured record containing attributes like gfcid, action type, etc.
 
-4. Business Logic (Step-by-Step Explanation)
+✅ Purpose:
+Feeds all rejected region-based records (from previous processing) to this subgraph for marking their load status in the staging tables.
 
-The graph begins by reading all records from KYC_GBL_MAIN.TRADE_HIERARCHY_INTF.
+3. Transformation: Reformat
 
-The Region Filter checks each record to see if it matches the target processing region using a series of conditional rules.
+Component: Reformat
 
-The expression includes hardcoded regional conditions for key countries (Mexico, Korea, China) and lookup-based matching for other countries.
+Transformation Count: 1
 
-Rule Details:
+Transformation Logic:
 
-Mexico Condition:
-If the ${REGION} parameter starts with “M” and the agg_country value is 'MX', the record is selected.
+out::reformat(in) = begin
+  out.id             :: in.tradepup_action.gfcid;
+  out.load_status    :: 'RGN FILTERED OUT';
+  out.lst_upd_dt     :: (date("YYYYMMDD")) now();
+  out.lst_upd_id     :: '${CREATE_ID}';
+  out.lst_upd_time   :: (datetime_to_unixtime(utc_now()) * 100);
+end;
 
-Korea Condition:
-If the ${REGION} parameter starts with “K” and the agg_country value is 'KR', the record is selected.
+Explanation (Step-by-Step):
 
-China Condition:
-If the ${REGION} parameter starts with “C” and the transaction_country is 'CN', the record is selected.
+Extracts the GFCID from the nested tradepup_action record and assigns it to the output field id.
 
-Generic Lookup Condition:
-For other regions, the component uses a lookup file ISO_COUNTRY_LKP to find the custom_region of the agg_country.
-If this custom_region is part of the list [vector ${PROCESS_REGION}], then the record is included.
+Sets the load_status field to 'RGN FILTERED OUT', marking these transactions as region-filtered rejections.
 
-5. Outputs and Routing
+Populates the update timestamp fields:
 
-Main Output (AGGR Hierarchy Extr):
-The filtered records that satisfy the region logic are written to the output dataset AGGR Hierarchy Extr.
-These records represent the trade hierarchy data relevant to the selected region.
+lst_upd_dt = current system date in YYYYMMDD format.
 
-Trash / Trash-1 Outputs:
-These are discard paths used to route records that do not match the filter criteria.
+lst_upd_time = UTC epoch time in milliseconds.
 
-Trash: For records that fail lookup or don’t belong to any region.
+Assigns the update user/job identifier:
 
-Trash-1: For special rejects or data that cannot be associated with a valid region.
+lst_upd_id = ${CREATE_ID} (dynamic environment parameter).
+
+Passes all other fields (id_type, client_type, country, batch_id, batch_dt, etc.) as defined in the output record format.
+
+✅ Purpose:
+Standardizes rejected records into a consistent load status update structure for downstream staging updates.
+
+4. Update Component: MUT
+
+Component: MUT (Multi Update Table)
+
+Parameters:
+
+continuous = False
+
+batchSize = 1
+
+commitTable = $COMMIT_TABLE
+
+jobid = dynamically passed runtime variable
+
+Primary SQL Files (executed sequentially):
+
+$AI_SQL/kyc_interface_giw_TRADE_TXN_SMR Y_load_status_update.sql
+
+$AI_SQL/kyc_interface_giw_TRADE_TXN_SMRY_JURIS_load_status_update.sql
+
+$AI_SQL/kyc_interface_giw_TRADE_TXN_COMMODITY_SMR Y_load_status_update.sql
+
+$AI_SQL/kyc_interface_giw_TRADE_TXN_LC_SMR Y_JURIS_load_status_update.sql
+
+SQL Update Logic (Common Pattern):
+
+Each .sql file performs a similar UPDATE against a different staging or summary table.
+The SQL structure follows this pattern:
+
+UPDATE <STG_TABLE_NAME>
+SET 
+    LOAD_STATUS = 'RGN FILTERED OUT',
+    LST_UPD_DT  = TO_DATE(SYSDATE, 'YYYYMMDD'),
+    LST_UPD_ID  = '${CREATE_ID}',
+    LST_UPD_TIME = (EXTRACT(EPOCH FROM SYSTIMESTAMP) * 100)
+WHERE 
+    ID = :in.id
+    AND (other key columns match if applicable);
+
+
+✅ Purpose:
+To propagate the “Region Filtered Out” status update across all related Trade Summary staging tables (Trade, Jurisdiction, Commodity, and LC Summary levels).
+Each record is updated atomically and managed within a two-phase commit group ($COMMIT_TABLE) for data consistency.
+
+5. Error and Reject Handling
+
+Composite Component: Reject and Error Files
+
+Subcomponents:
+
+Log File – stores processing and transactional logs.
+
+Err File – captures failed update attempts from MUT with error details.
+
+Reject File – captures transformation-level rejects from Reformat or database constraint rejections.
+
+Unused File – captures non-critical or redundant records (unused payloads).
+
+Gather / Gather-1 – merges multiple reject/error streams for unified output logging.
+
+Each reject/error file follows DML patterns like:
+
+include "~$AB_HOME/include/error-info-type.dml";
+record
+   ${TABLE}_type ${TABLE};
+   string('\r\n') error_message = NULL('');
+end;
+
+
+✅ Purpose:
+Ensures all failed transactions, mismatched keys, or SQL exceptions are written to the appropriate audit files for investigation and reconciliation.
+
+6. Transaction Management
+
+The overall process is wrapped inside a transaction group managed via BT (Begin Transaction) and ET (End Transaction) (from previous subgraph context).
+
+The MUT uses $COMMIT_TABLE to ensure all updates to multiple tables are atomic, i.e., all succeed or all rollback.
+
+7. Parameters Summary
+Parameter	Purpose
+$DBC_FILE	Database connection configuration
+$COMMIT_TABLE	Commit scope control for transaction
+${CREATE_ID}	Identifier for the user/job triggering the update
+$AI_SQL	Path variable pointing to SQL script directory
+$AI_DML	Path variable pointing to DML directory
+utc_now(), now()	Functions to fetch system time in UTC and date format
+transaction_group	Logical grouping for BT–MUT–ET commit flow
+8. End-to-End Business Logic Summary (Narrative)
+
+The graph Update STG LOAD_STATUS reads region-rejected trade records from the RGN Rejects dataset.
+Each record is transformed in Reformat to build a consistent update payload, setting load_status as 'RGN FILTERED OUT' along with system-generated timestamps and job identifiers.
+The MUT component sequentially executes four SQL update scripts to synchronize the load status across multiple staging summary tables (Trade, Jurisdiction, Commodity, and LC Summary).
+The transaction runs in a controlled commit scope ($COMMIT_TABLE), ensuring data consistency.
+If any record fails transformation or SQL execution, it is routed to the respective Reject, Error, or Log files, maintaining complete audit traceability.
+Finally, successful updates mark the regional rejects as processed, enabling downstream reporting to exclude them from further loads.
