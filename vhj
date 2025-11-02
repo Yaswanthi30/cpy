@@ -1,26 +1,3 @@
-Got it. Here’s a clear, sentence-style explanation for the mapping you showed (the branch that builds the LR File by combining GFCID-EXCP and CIN Exceptions), with the source/target files called out and the exact transform logic spelled out for each step and the subgraph.
-
-Overview (what this flow does)
-
-This flow produces a single LR File that lists hierarchy exceptions. It does that by (1) reshaping raw GFCID exception rows into LR shape, (2) deriving CIN-based exceptions by joining staging LR rows to a CIN lookup inside a subgraph, and (3) concatenating both exception streams. The target LR record layout comes from ${TABLE}_type in kyc_interface_giw_main_table.dml.
-
-Sources and Targets (by component)
-
-Source A (file): GFCID-EXCP
-DML: from your EXCP lookup file (earlier defined as EXCP_FILE / excp_lkp) that carries gfcid, id_type, batch_dt, client_type, month, year, country, and exception attributes such as exception_cd, giw_business_unit, primary_owner_business_unit.
-
-Source B (subgraph input 1): STG LR
-DML: include "${AI_DML}/kyc_interface_giw_stage.dml"; metadata type = ${STG_TABLE}_type
-This is the staging LR stream that already looks like LR (has gfcid, id_type, batch_dt, client_type, month, year, country, etc.).
-
-Source C (subgraph input 2 / lookup): CIN-EXCP
-DML: include "~${AI_DML}/kyc_interface_giw_hierarchy_trade_pup.dml"; metadata type = cin_lookup
-This provides CIN attributes (cin_code, cin_reason, cin_source, …) keyed by (id, country).
-
-Final Target (file): LR File
-DML: include "~${AI_DML}/kyc_interface_giw_main_table.dml"; metadata type = ${TABLE}_type
-Receives concatenated exception rows in LR format.
-
 Mapping A — GFCID-EXCP → Reformat → LR-shaped stream
 
 What it does (in words):
