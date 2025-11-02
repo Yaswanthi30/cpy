@@ -1,146 +1,182 @@
-Mapping A — GFCID-EXCP → Reformat → LR-shaped stream
+Mapping Name
 
-What it does (in words):
-We take raw GFCID exception rows and reshape them into the LR schema. All business keys and contextual fields are passed through; an exception envelope (giw_exception) is constructed from EXCP attributes; and audit fields are stamped.
+Update STG_LOAD_STATUS
 
-Transform (Reformat) logic used:
+🔹 Purpose
 
-Helper includes and constants are set once: we import genUUID.xfr, compute CURRENT_DATE = date("YYYYMMDD") now(), and LST_UPD_TIME = datetime_to_unixtime(utc_now()) * 100.
+This mapping updates the load status of transaction-level records in the staging and summary tables.
+It takes as input both successfully loaded and rejected transactions from previous processing, normalizes them, assigns audit metadata, merges and deduplicates them, and executes SQL updates through the MUT component to ensure downstream tables accurately reflect the latest exception or failure status.
 
-Field mapping is a straight pass-through for identifiers and period columns; exception fields are bundled.
+🔹 Source Files
+1️⃣ Loaded File
 
-Pseudocode of the transform (exact intent):
+Path/Type: ~$AI_DML/kyc_interface_giw_main_table.dml
 
-/* helpers */
-include "~${AI_XFR}/genUUID.xfr";
-let date("YYYYMMDD") CURRENT_DATE = date("YYYYMMDD") now();
-let decimal(..., sign_reserved) LST_UPD_TIME = datetime_to_unixtime(utc_now())*100;
+Metadata Type: ${TABLE}_type
 
-/* LR fields */
-out.gfcid       :: in.gfcid;
-out.id_type     :: in.id_type;
-out.batch_dt    :: in.batch_dt;
-out.client_type :: in.client_type;
-out.month       :: in.month;
-out.year        :: in.year;
-out.country     :: in.country;
+Purpose: Contains successfully loaded LR transactions from the previous stage.
 
-/* business exception built from EXCP attributes */
-out.giw_exception :: build_exception(
-   code  => in.exception_cd,
-   bu    => in.giw_business_unit,
-   owner => in.primary_owner_business_unit
-);
+Fields:
+id, id_type, client_type, country, month, year, batch_dt, feed_type, load_status, lst_upd_dt, lst_upd_id, lst_upd_time
 
-/* audit, if present in ${TABLE}_type */
-out.lst_upd_dt   :: CURRENT_DATE;
-out.lst_upd_id   :: '${CREATE_ID}';
-out.lst_upd_time :: LST_UPD_TIME;
+2️⃣ Rej Txn With Error
 
+Path/Type:
+~$AI_DML/kyc_interface_giw_main_table.dml
+plus ~$AB_HOME/include/error-info-type.dml
 
-Source → Target fields (summary):
-gfcid,id_type,batch_dt,client_type,month,year,country → same names in LR;
-exception_cd,giw_business_unit,primary_owner_business_unit → giw_exception (constructed object/record).
+Metadata Type:
+Combines ${TABLE}_type with error_info_t.
 
-Emitted to: LR-shaped stream (goes to Concatenate).
+Purpose: Contains rejected transactions or those with transformation/load failures.
 
-Subgraph — “CIN Exceptions (Read Only)”
+Additional Fields:
+error_message, error_code, error_time
 
-What it does (in words):
-Inside the subgraph, we inner-join the staging LR rows (STG LR) with a CIN lookup (CIN-EXCP) on {id, country} to identify records with a CIN exception. For every match, we keep the LR keys from STG and construct a CIN-specific exception payload for giw_exception. Audit stamps are added the same way.
+Role: Used to identify failed records and update their status as EXCEPTION-FAILED.
 
-Inputs:
+🔹 Transformations and Business Logic
+🔸 Multi Reformat
 
-STG LR (LR-like rows)
+Count: 2 (Two input streams)
 
-CIN-EXCP (cin_lookup record)
+Input 0: Loaded File
 
-Join parameters / keys / type:
+Input 1: Rej Txn With Error
 
-count = 2
+Purpose: Standardizes data from both streams into a single, consistent schema.
 
-sorted-input = False
+Business Logic:
 
-key = { id; country }
+For Loaded File:
 
-join-type = Inner (only matched rows become exceptions)
+out.client_type = in.giw_client_type
 
-Pseudocode of the subgraph’s Join transform:
+out.load_status = 'EXCEPTION'
 
-include "~${AI_XFR}/genUUID.xfr";
-let date("YYYYMMDD") CURRENT_DATE = date("YYYYMMDD") now();
-let decimal(..., sign_reserved) LST_UPD_TIME = datetime_to_unixtime(utc_now())*100;
+out.lst_upd_dt = (date("YYYYMMDD")) now()
 
-/* out from inner-join: keep LR keys from STG and build the CIN exception */
-out.gfcid       :: in0.gfcid;     /* STG LR */
-out.id_type     :: in0.id_type;
-out.batch_dt    :: in0.batch_dt;
-out.client_type :: in0.client_type;
-out.month       :: in0.month;
-out.year        :: in0.year;
-out.country     :: in0.country;
+out.lst_upd_id = '${CREATE_ID}'
 
-/* CIN-derived business exception */
-out.giw_exception :: build_cin_exception(
-   cin_code   => in1.cin_code,
-   cin_reason => in1.cin_reason,
-   cin_source => in1.cin_source
-);
+out.lst_upd_time = datetime_to_unixtime(utc_now()) * 100
 
-/* audit */
-out.lst_upd_dt   :: CURRENT_DATE;
-out.lst_upd_id   :: '${CREATE_ID}';
-out.lst_upd_time :: LST_UPD_TIME;
+For Rej Txn With Error:
+
+out.client_type = in.GIW_BATCH_EXCP_LOG.giw_client_type
+
+out.load_status = 'EXCEPTION-FAILED'
+
+Other audit fields same as above.
+
+Output Metadata:
+
+record
+    utf8 string(160) id;
+    utf8 string(20)  id_type;
+    utf8 string(1)   client_type;
+    utf8 string(10)  load_status;
+    date("YYYYMMDD") lst_upd_dt;
+    utf8 string(25)  lst_upd_id;
+    decimal(15)      lst_upd_time;
+end;
 
 
-Source → Target fields (summary):
-From STG LR: gfcid,id_type,batch_dt,client_type,month,year,country → same in LR;
-From CIN-EXCP: cin_code,cin_reason,cin_source → giw_exception (constructed).
+Purpose Summary: Adds consistent audit metadata to every record and differentiates between successful and failed exception flows.
 
-Emitted to: LR-shaped stream (goes to Concatenate).
+🔸 Concatenate
 
-Concatenate — merge the two exception streams
+Purpose: Merges both output streams from Multi Reformat into one flow.
 
-What it does (in words):
-The Concatenate component performs a UNION ALL of the two LR-shaped streams (GFCID exceptions and CIN exceptions) without sorting or deduplication. This yields a single, combined LR exception feed.
+Logic: Performs a union of both “EXCEPTION” and “EXCEPTION-FAILED” streams without filtering or transformation.
 
-Why Concatenate is correct here:
-Both upstream branches already conform to the same LR record type (${TABLE}_type) and carry their own giw_exception payloads; therefore appending is safe and preserves full lineage.
+Output Layout: Same as Multi Reformat.
 
-Target — LR File
+🔸 Sort
 
-What it does (in words):
-The LR File accepts the concatenated stream and writes it using the main LR DML:
-include "~${AI_DML}/kyc_interface_giw_main_table.dml"; metadata type = ${TABLE}_type.
+Key: {id; batch_dt; client_type; country; month; year}
 
-Effective columns written (based on your DML excerpts):
-gfcid, id_type, batch_dt, client_type, month, year, country, giw_exception
-(+ audit columns such as lst_upd_dt, lst_upd_id, lst_upd_time if defined in ${TABLE}_type).
+Purpose: Orders the records to prepare for deduplication.
 
-Parameters & runtime constants used (complete list)
+Max Core: 100663296
 
-include "~${AI_XFR}/genUUID.xfr"; (utility functions)
+Logic: Sorting ensures all duplicate entries (for same ID and time window) are grouped together for consistent deduplication.
 
-CURRENT_DATE = date("YYYYMMDD") now();
+🔸 Dedup
 
-LST_UPD_TIME = datetime_to_unixtime(utc_now()) * 100;
+Key: {id; batch_dt; client_type; country; month; year}
 
-${CREATE_ID} (populates lst_upd_id)
+Select: last
 
-${AI_DML} (base path for DML includes)
+Check-Sort: True
 
-${TABLE}_type (final LR record type)
+Purpose: Removes duplicate records that share the same unique key.
 
-${STG_TABLE}_type (staging LR record type, used inside the subgraph)
+Business Logic: Keeps only the last occurrence of each key combination, preserving the latest exception state.
 
-Put simply (one-line per branch)
+🔸 MUT (Multi Update Table)
 
-GFCID-EXCP → Reformat → (LR-shape): pass keys & period fields, wrap EXCP attributes into giw_exception, stamp audit.
+Batch Size: 1 (per-row commits for safe updates)
 
-STG LR ⨝ CIN-EXCP (Inner): keep LR keys from STG, derive giw_exception from CIN match, stamp audit.
+Commit Table: $COMMIT_TABLE
 
-Concatenate: append both LR streams.
+Primary SQL Scripts:
 
-LR File: write out using ${TABLE}_type in kyc_interface_giw_main_table.dml.
+$AI_SQL/kyc_interface_giw_TRADE_TXN_SMRY_load_status_update.sql
 
-If you want this duplicated for the earlier LR_1 plan (with BT/MUT/ET/reject/log/unused), say “do LR_1 too” and I’ll lay it out in the same sentence-plus-logic style.
+$AI_SQL/kyc_interface_giw_TRADE_TXN_SMRY_JURIS_load_status_update.sql
+
+$AI_SQL/kyc_interface_giw_TRADE_TXN_COMMODITY_SMRY_load_status_update.sql
+
+$AI_SQL/kyc_interface_giw_TRADE_TXN_LC_SMRY_JURIS_load_status_update.sql
+
+SQL Function: Each updates one of the main trade summary tables with the record’s load status and audit columns.
+
+Transform Input:
+All use the same DML layout → ${AI_DML}/kyc_interface_giw_main_table.dml
+
+Business Logic (Sentence Form):
+
+Each record drives four SQL updates corresponding to different summary dimensions.
+
+The SQLs set LOAD_STATUS, LST_UPD_DT, LST_UPD_ID, and LST_UPD_TIME in the target tables.
+
+The commit table ensures transactional integrity across multiple update operations.
+
+Failed SQL executions are redirected to Error/Reject ports.
+
+Logs are captured for all operations, successful or failed.
+
+🔹 Reject & Error Handling
+File	Purpose	Content / DML
+Reject File	Captures records rejected during transformation or load	${TABLE}_type + error_message
+Err File	Stores SQL-level errors from MUT	error_info_t
+Log File	Audit trail for all executed updates (success/failure, timestamps, counts)	log_info_t
+Unused File	Collects unprocessed log fragments from Gather component	Standard layout
+🔹 Target Tables Updated by MUT
+
+TRADE_TXN_SMRY
+
+TRADE_TXN_SMRY_JURIS
+
+TRADE_TXN_COMMODITY_SMRY
+
+TRADE_TXN_LC_SMRY_JURIS
+
+All updates apply the following:
+
+LOAD_STATUS = 'EXCEPTION' or 'EXCEPTION-FAILED'
+
+LST_UPD_DT = current date
+
+LST_UPD_ID = ${CREATE_ID}
+
+LST_UPD_TIME = epoch timestamp (ms)
+
+🔹 End-to-End Data Flow Summary (Business Logic Narrative)
+
+The Loaded File and Rejected Transactions act as dual input streams for the status update process.
+Both are standardized in Multi Reformat, where audit fields are populated and statuses (EXCEPTION, EXCEPTION-FAILED) are assigned.
+The data is merged using Concatenate, sorted by composite business keys, and deduplicated to retain only the most recent instance of each transaction.
+Finally, the MUT component executes four SQL scripts that update the corresponding staging and summary tables, stamping accurate load status and timestamps for every transaction.
+Any failed or invalid updates are logged and routed to respective error and reject files for remediation.
+This ensures full reconciliation between data ingestion, exception management, and downstream KYC reporting.
