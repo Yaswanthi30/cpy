@@ -1,108 +1,90 @@
-Overall purpose
+OSource files
+1) DBC template (text)
 
-The Load Status Update graph refreshes the LOAD_STATUS and audit columns (LST_UPD_DT, LST_UPD_ID, LST_UPD_TIME) in each region’s KYC Trade Interface summary tables.
-It reads a single flat file of load-status records, replicates those records to the three regional subgraphs, and inside each subgraph runs four SQL UPDATE statements—one for each summary table.
+Path: /home/yn42261/private_sand/GFTS/KYC/etl_interfaces/db/kyc_stg1_rgn_ld.dbc
 
-Source
+Content model: plain-text lines. The transform expects at least these keys at the start of a line:
 
-The graph reads from the file $WI_LOAD_STATUS_FILE, which is a delimited flat file such as
-/abinitio/data/CitiTech/mfs/mfs_way/GFTS/KYC/etl_interfaces/reject/..._load_status_YYYYMMDD_YYYYMMDDHHMMSS.dat.
-Each record contains the following fields:
+db_name: …
 
-id, id_type, client_type, country, month, year, batch_id, batch_dt, load_status, feed_type, lst_upd_id, lst_upd_dt, lst_upd_time.
+user: …
 
-Replication
+encrypted_password: …
 
-Every record is replicated to the three output branches: NAM, APAC, and IDN.
-Whether a branch executes is decided by its condition expression.
+(All other lines are carried through unchanged.)
 
-Branch-selection logic (line by line)
-NAM branch
-${ if(
-      (REGION != 'NAM')
-   and ('NAM' member string_split_no_empty(DB_REGION_LIST, "\n"))
-   ) 1 else 0 }
+2) Regional configuration catalog (CSV)
 
-APAC branch
-${ if(
-      (REGION != 'APAC')
-   and ('APAC' member string_split_no_empty(DB_REGION_LIST, "\n"))
-   ) 1 else 0 }
+Path: /home/yn42261/sand/GFTS/KYC/kyc_db_common/kyc_config.csv
 
-IDN branch
-${ if(
-      (REGION != 'IDN')
-   and ('IDN' member string_split_no_empty(DB_REGION_LIST, "\n"))
-   ) 1 else 0 }
+Content model: one row per PHASE (region/environment). The code uses a case-insensitive match on the phase string and then splits that row by commas (quote-aware).
 
+Fields actually consumed by the mapping (by index in the parsed vector):
 
-Sentence meaning:
-For each region, the subgraph runs only when the job’s global REGION parameter is not equal to that region name and the same region code is explicitly listed in the newline-delimited parameter DB_REGION_LIST.
-If both parts are true, the expression returns 1 and that branch executes; otherwise it is skipped.
+PHASE – the row selector (e.g., DEV-APAC, DEV-NAM, DEV-IDN) – used to find the row.
 
-Processing inside every regional subgraph
+db_name – vector position 2 (0-based in code): database/service name for that region.
 
-Each branch contains an identical Multi-Update Table (MUT) component named MUT_<REGION>.
+user – vector position 5: login/user for that region.
 
-DBConfigFile → region-specific connection ($APAC_DBC, $IDN_DBC, etc.).
+encrypted_password – vector position 6: encrypted password string for that user.
 
-commitTable → $COMMIT_TABLE to ensure transactional commits.
+(Other columns like db_version, db_home, db_nodes, tns_admin may exist in the row but are not used by the current logic.)
 
-batchSize = 1, continuous = False for row-level commit control.
+Note: Positions above are derived from the PARAM_VEC[2], [5], [6] references in your Reformat.
 
-count = 4 because four SQL scripts run sequentially.
+Business logic (sentence form)
 
-SQL files executed (same for all regions)
+Create_Data emits a single dummy integer record purely to drive the flow.
 
-$AI_SQL/kyc_interface_giw_TRADE_TXN_SMRY_load_status_update.sql
+Replicate sends this record to three identical regional branches: ASPAC, NAM, and IDN.
 
-$AI_SQL/kyc_interface_giw_TRADE_TXN_SMRy_JURIS_load_status_update.sql
+In each branch’s Reformat:
 
-$AI_SQL/kyc_interface_giw_TRADE_TXN_COMMODITY_SMRY_load_status_update.sql
+The component reads the DBC template file (kyc_stg1_rgn_ld.dbc) into a list of lines.
 
-$AI_SQL/kyc_interface_giw_TRADE_TXN_LC_SMRy_JURIS_load_status_update.sql
+It sets a region-specific PHASE constant: DEV-APAC, DEV-NAM, or DEV-IDN.
 
-Each file contains the same parameterized statement; only the table name changes.
+It reads the CSV catalog (kyc_config.csv), locates the row whose phase matches the branch’s PHASE (string upper-cased for matching), and splits that row by commas (respecting quotes).
 
-Resolved SQL statement
-UPDATE KYC_RGN_STG.<TABLE_NAME>
-   SET LOAD_STATUS = :load_status,
-       LST_UPD_DT  = :lst_upd_dt,
-       LST_UPD_ID  = :lst_upd_id,
-       LST_UPD_TIME= :lst_upd_time
- WHERE ID          = :id
-   AND ID_TYPE     = :id_type
-   AND CLIENT_TYPE = :client_type
-   AND COUNTRY     = :country
-   AND MONTH       = :month
-   AND YEAR        = :year
-   AND BATCH_DT    = :batch_dt;
+From that split row it extracts:
 
+db_name from element 2,
 
-Sentence explanation:
-For every record passed into the MUT, Ab Initio substitutes the field values from the Load Status File into the named parameters, finds the matching row in each regional target table using the composite key (id, id_type, client_type, country, month, year, batch_dt), and updates its status and timestamp columns.
+user from element 5,
 
-Reject and error handling
+encrypted_password from element 6.
 
-If an update fails—because the key is missing, the record violates a constraint, or a database error occurs—the failing row is written to that region’s Reject and Error dataset (for example, NAM-Reject and Error).
-These reject flows capture the original record plus standard error metadata such as component name, SQL code, and error message.
+It validates that each of the three values exists; if any is missing, it raises a configuration error (via fail_if_error/force_error) and the branch stops.
 
-Targets
+It walks the template lines and replaces:
 
-Each active regional branch updates four Oracle tables in its own schema:
+any line that starts with db_name → db_name: <db_name>
 
-KYC_RGN_STG.TRADE_TXN_SMRY
+any line that starts with user → user: <user>
 
-KYC_RGN_STG.TRADE_TXN_SMRy_JURIS
+any line that starts with encrypted_password → encrypted_password: <encrypted_password>
 
-KYC_RGN_STG.TRADE_TXN_COMMODITY_SMRY
+all other lines are passed through unchanged.
 
-KYC_RGN_STG.TRADE_TXN_LC_SMRY_JURIS
+Finally, it rejoins the modified lines with newlines to produce the final DBC text for that region.
 
-No new data files are produced; only reject/error logs appear if problems occur.
+Each branch’s …_dbc File component writes the final DBC to the region-specific path with mode 0666.
 
-Full sentence summary
+ASPAC → $APAC_DBC (file typically named aspac.dbc)
 
-The Load Status Update graph reads every record from the Load Status File and replicates it to the three regional branches — NAM, APAC, and IDN. Each branch executes only when its condition
-(REGION != <Region>) and (<Region> member string_split_no_empty(DB_REGION_LIST,"\n")) evaluates true.
-Within an active branch, the MUT component connects to that region’s database and runs four SQL UPDATE scripts that set LOAD_STATUS, LST_UPD_DT, LST_UPD_ID, and LST_UPD_TIME in the regional trade summary tables for the matching (id, id_type, client_type, country, month, year, batch_dt) key. Each record’s four updates occur in one transaction controlled by $COMMIT_TABLE; any database errors or constraint violations are sent to the region-specific Reject and Error files.
+NAM → $NAM_DBC (file typically named nam.dbc)
+
+IDN → $IDN_DBC (file typically named idn.dbc)
+
+Targets (outputs)
+Region	Target file variable	What’s in the file
+ASPAC	$APAC_DBC (e.g., aspac.dbc)	The template with db_name, user, encrypted_password replaced by APAC values from kyc_config.csv.
+NAM	$NAM_DBC (e.g., nam.dbc)	The template with those three keys replaced by NAM values.
+IDN	$IDN_DBC (e.g., idn.dbc)	The template with those three keys replaced by IDN values.
+
+All other template lines are preserved verbatim; only the three keys are substituted.
+
+One-line overview
+
+The job reads a shared DBC template and a regional CSV catalog, picks the row for the current region, substitutes db_name, user, and encrypted_password into the template, and writes the completed .dbc for ASPAC, NAM, and IDN respectively.
