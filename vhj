@@ -1,182 +1,110 @@
-Mapping Name
+Mapping Name: WorkItem_In_to_TBL
 
-Update STG_LOAD_STATUS
+The mapping reads the WorkItem_In source file, reformats and enriches the data through the Ref_WI_In_to_TBL component, and finally writes the transformed records into the LR_File target.
 
-🔹 Purpose
+Source
 
-This mapping updates the load status of transaction-level records in the staging and summary tables.
-It takes as input both successfully loaded and rejected transactions from previous processing, normalizes them, assigns audit metadata, merges and deduplicates them, and executes SQL updates through the MUT component to ensure downstream tables accurately reflect the latest exception or failure status.
+The source file used in this mapping is WorkItem_In, defined using the DML file ~$AI_DML/kyc_interface_giw_hierarchy_trade_pup.dml.
+This file contains hierarchical work-item data from the GIW hierarchy process.
+The input metadata includes the following key fields:
 
-🔹 Source Files
-1️⃣ Loaded File
+gfcid – Global Financial Client Identifier.
 
-Path/Type: ~$AI_DML/kyc_interface_giw_main_table.dml
+id_type – Identifier type for the record.
 
-Metadata Type: ${TABLE}_type
+batch_dt – The batch processing date in DD/MM/YYYY format.
 
-Purpose: Contains successfully loaded LR transactions from the previous stage.
+client_type – Type of client, represented as a single character.
 
-Fields:
-id, id_type, client_type, country, month, year, batch_dt, feed_type, load_status, lst_upd_dt, lst_upd_id, lst_upd_time
+month – Month code for the record.
 
-2️⃣ Rej Txn With Error
+year – Year code for the record.
 
-Path/Type:
-~$AI_DML/kyc_interface_giw_main_table.dml
-plus ~$AB_HOME/include/error-info-type.dml
+country – Country code.
 
-Metadata Type:
-Combines ${TABLE}_type with error_info_t.
+workitem_req – A structured record that holds detailed work item request information.
 
-Purpose: Contains rejected transactions or those with transformation/load failures.
+The file layout is read using the $WI_OUT_FILE mfile location.
 
-Additional Fields:
-error_message, error_code, error_time
+Business Logic (Transformation – Ref_WI_In_to_TBL)
 
-Role: Used to identify failed records and update their status as EXCEPTION-FAILED.
+The transformation component Ref_WI_In_to_TBL performs a reformat operation to convert the nested work-item structure into a flat, table-ready format that aligns with the TRADE_PUP_WI_REQ_INTF record type.
 
-🔹 Transformations and Business Logic
-🔸 Multi Reformat
+The transformation first includes the UUID generator file ~$AI_XFR/genUUID.xfr and defines helper variables for audit and timestamp fields:
 
-Count: 2 (Two input streams)
+CURRENT_DATE = date("YYYYMMDD") now() → Captures the current system date.
 
-Input 0: Loaded File
+LST_UPD_TIME = datetime_to_unixtime(utc_now()) * 100 → Captures the timestamp in milliseconds.
 
-Input 1: Rej Txn With Error
+A generic UUID function get_string_unique_key() is available for unique ID generation, though not used directly in this mapping.
 
-Purpose: Standardizes data from both streams into a single, consistent schema.
+During processing, each input record is transformed as follows:
 
-Business Logic:
+Region Derivation:
+The region_initiated field is derived from internal region codes such as NAM, APAC, and MEXICO.
+For example, 'NAM' is standardized as 'NA', and 'APAC' becomes 'ASPAC'.
+This ensures consistent region representation in the output.
 
-For Loaded File:
+Calendar and Identification Fields:
+The mapping transfers basic date attributes directly:
 
-out.client_type = in.giw_client_type
+month = in.month
 
-out.load_status = 'EXCEPTION'
+year = in.year
 
-out.lst_upd_dt = (date("YYYYMMDD")) now()
+batch_dt = in.batch_dt
 
-out.lst_upd_id = '${CREATE_ID}'
+batch_id = '202009010053706' (constant value representing the batch run ID)
 
-out.lst_upd_time = datetime_to_unixtime(utc_now()) * 100
+Client Information:
 
-For Rej Txn With Error:
+client_type = in.workitem_req.client_type
 
-out.client_type = in.GIW_BATCH_EXCP_LOG.giw_client_type
+client_segment = in.client_type
 
-out.load_status = 'EXCEPTION-FAILED'
+Audit Columns:
+System-level audit information is added to each record:
 
-Other audit fields same as above.
+create_id = 'SYSTEM'
 
-Output Metadata:
+create_dt = CURRENT_DATE
 
-record
-    utf8 string(160) id;
-    utf8 string(20)  id_type;
-    utf8 string(1)   client_type;
-    utf8 string(10)  load_status;
-    date("YYYYMMDD") lst_upd_dt;
-    utf8 string(25)  lst_upd_id;
-    decimal(15)      lst_upd_time;
-end;
+lst_upd_id = 'SYSTEM'
 
+lst_upd_dt = CURRENT_DATE
 
-Purpose Summary: Adds consistent audit metadata to every record and differentiates between successful and failed exception flows.
+lst_upd_time = LST_UPD_TIME
 
-🔸 Concatenate
+Additional default values are set:
 
-Purpose: Merges both output streams from Multi Reformat into one flow.
+ver_num = 0
 
-Logic: Performs a union of both “EXCEPTION” and “EXCEPTION-FAILED” streams without filtering or transformation.
+kyc_shard_num = 3000
 
-Output Layout: Same as Multi Reformat.
+Payload Flattening:
+The entire nested structure workitem_req.* is copied into the flat output layout using the expression:
 
-🔸 Sort
+out.TRADE_PUP_WI_REQ_INTF.* :1: in.workitem_req.*;
 
-Key: {id; batch_dt; client_type; country; month; year}
 
-Purpose: Orders the records to prepare for deduplication.
+This ensures all subfields inside the work item request are preserved in the target table.
 
-Max Core: 100663296
+Enrichment:
+A new column transacting_gfcid is added and populated with the input field in.gfcid.
+This change was introduced as part of enhancement SIO387J.
 
-Logic: Sorting ensures all duplicate entries (for same ID and time window) are grouped together for consistent deduplication.
+The overall transformation outputs a fully standardized record aligned with the downstream interface schema.
 
-🔸 Dedup
+Target
 
-Key: {id; batch_dt; client_type; country; month; year}
+The target dataset for this mapping is LR_File, defined using the metadata file ~$AI_DML/kyc_interface_giw_main_table.dml.
+The data is written in the format of TRADE_PUP_WI_REQ_INTF_type, which matches the transformed output structure.
+The file path is configured using $LR_FILE as the dataset reference.
 
-Select: last
+The target contains all flattened work item details, standardized region codes, client and batch identifiers, and audit information.
+This LR file acts as the staging table for downstream processing and loading into the GIW Trade Summary tables.
 
-Check-Sort: True
+Summary
 
-Purpose: Removes duplicate records that share the same unique key.
-
-Business Logic: Keeps only the last occurrence of each key combination, preserving the latest exception state.
-
-🔸 MUT (Multi Update Table)
-
-Batch Size: 1 (per-row commits for safe updates)
-
-Commit Table: $COMMIT_TABLE
-
-Primary SQL Scripts:
-
-$AI_SQL/kyc_interface_giw_TRADE_TXN_SMRY_load_status_update.sql
-
-$AI_SQL/kyc_interface_giw_TRADE_TXN_SMRY_JURIS_load_status_update.sql
-
-$AI_SQL/kyc_interface_giw_TRADE_TXN_COMMODITY_SMRY_load_status_update.sql
-
-$AI_SQL/kyc_interface_giw_TRADE_TXN_LC_SMRY_JURIS_load_status_update.sql
-
-SQL Function: Each updates one of the main trade summary tables with the record’s load status and audit columns.
-
-Transform Input:
-All use the same DML layout → ${AI_DML}/kyc_interface_giw_main_table.dml
-
-Business Logic (Sentence Form):
-
-Each record drives four SQL updates corresponding to different summary dimensions.
-
-The SQLs set LOAD_STATUS, LST_UPD_DT, LST_UPD_ID, and LST_UPD_TIME in the target tables.
-
-The commit table ensures transactional integrity across multiple update operations.
-
-Failed SQL executions are redirected to Error/Reject ports.
-
-Logs are captured for all operations, successful or failed.
-
-🔹 Reject & Error Handling
-File	Purpose	Content / DML
-Reject File	Captures records rejected during transformation or load	${TABLE}_type + error_message
-Err File	Stores SQL-level errors from MUT	error_info_t
-Log File	Audit trail for all executed updates (success/failure, timestamps, counts)	log_info_t
-Unused File	Collects unprocessed log fragments from Gather component	Standard layout
-🔹 Target Tables Updated by MUT
-
-TRADE_TXN_SMRY
-
-TRADE_TXN_SMRY_JURIS
-
-TRADE_TXN_COMMODITY_SMRY
-
-TRADE_TXN_LC_SMRY_JURIS
-
-All updates apply the following:
-
-LOAD_STATUS = 'EXCEPTION' or 'EXCEPTION-FAILED'
-
-LST_UPD_DT = current date
-
-LST_UPD_ID = ${CREATE_ID}
-
-LST_UPD_TIME = epoch timestamp (ms)
-
-🔹 End-to-End Data Flow Summary (Business Logic Narrative)
-
-The Loaded File and Rejected Transactions act as dual input streams for the status update process.
-Both are standardized in Multi Reformat, where audit fields are populated and statuses (EXCEPTION, EXCEPTION-FAILED) are assigned.
-The data is merged using Concatenate, sorted by composite business keys, and deduplicated to retain only the most recent instance of each transaction.
-Finally, the MUT component executes four SQL scripts that update the corresponding staging and summary tables, stamping accurate load status and timestamps for every transaction.
-Any failed or invalid updates are logged and routed to respective error and reject files for remediation.
-This ensures full reconciliation between data ingestion, exception management, and downstream KYC reporting.
+In summary, the WorkItem_In_to_TBL mapping extracts work item data from the WorkItem_In file, reformats and enriches it with standardized region, audit, and shard details, and writes the transformed records into the LR_File.
+The process ensures that all hierarchical structures are flattened, unique identifiers are standardized, and audit information is embedded for traceability.
