@@ -1,90 +1,100 @@
-OSource files
-1) DBC template (text)
+WORKITEM_IN — End-to-End Explanation
+✅ 1. Source file
 
-Path: /home/yn42261/private_sand/GFTS/KYC/etl_interfaces/db/kyc_stg1_rgn_ld.dbc
+WorkItem_In reads an input file (Work Item file).
 
-Content model: plain-text lines. The transform expects at least these keys at the start of a line:
+From your screenshot:
 
-db_name: …
+mfile:$WI_OUT_FILE
 
-user: …
 
-encrypted_password: …
+✅ This means the actual source file path comes from the runtime parameter WI_OUT_FILE.
 
-(All other lines are carried through unchanged.)
+So WorkItem_In reads the file referenced by $WI_OUT_FILE.
 
-2) Regional configuration catalog (CSV)
+✅ 2. Metadata (fields)
 
-Path: /home/yn42261/sand/GFTS/KYC/kyc_db_common/kyc_config.csv
+WorkItem_In uses:
 
-Content model: one row per PHASE (region/environment). The code uses a case-insensitive match on the phase string and then splits that row by commas (quote-aware).
+include "~$AI_DML/kyc_interface_giw_hierarchy_trade_pup.dml";
 
-Fields actually consumed by the mapping (by index in the parsed vector):
 
-PHASE – the row selector (e.g., DEV-APAC, DEV-NAM, DEV-IDN) – used to find the row.
+Then the resolved record shows these fields:
 
-db_name – vector position 2 (0-based in code): database/service name for that region.
+Field Name	Type	Meaning
+gfcid	utf8 string(160)	Global Financial Customer ID
+id_type	utf8 string(20)	Identifier type
+batch_dt	date(DD/MM/YYYY)	Batch Date for the file
+client_type	utf8 string(1)	Client classification
+month	utf8 string(3)	Month extracted from input
+year	utf8 string(4)	Year extracted from input
+country	utf8 string(2)	Country code
+workitem_req	record workitem_req	Nested structure containing work item request details
 
-user – vector position 5: login/user for that region.
+✅ So WorkItem_In is reading a structured input file that contains trade hierarchy PUP work item information, including client, type, date, region, etc.
 
-encrypted_password – vector position 6: encrypted password string for that user.
+✅ 3. Business Logic in WorkItem_In
 
-(Other columns like db_version, db_home, db_nodes, tns_admin may exist in the row but are not used by the current logic.)
+WorkItem_In does NOT perform any transformation.
 
-Note: Positions above are derived from the PARAM_VEC[2], [5], [6] references in your Reformat.
+It only reads the file and the metadata describes the structure.
 
-Business logic (sentence form)
+No filter, no condition, no transformation.
 
-Create_Data emits a single dummy integer record purely to drive the flow.
+✅ So WorkItem_In simply provides the raw input record to the next component:
+Ref_WI_In_to_TBL
 
-Replicate sends this record to three identical regional branches: ASPAC, NAM, and IDN.
+✅ 4. Flow After WorkItem_In
 
-In each branch’s Reformat:
+WorkItem_In → Ref_WI_In_to_TBL → LR_File
 
-The component reads the DBC template file (kyc_stg1_rgn_ld.dbc) into a list of lines.
+In Ref_WI_In_to_TBL:
 
-It sets a region-specific PHASE constant: DEV-APAC, DEV-NAM, or DEV-IDN.
+The component includes a UUID generator
 
-It reads the CSV catalog (kyc_config.csv), locates the row whose phase matches the branch’s PHASE (string upper-cased for matching), and splits that row by commas (respecting quotes).
+It creates CURRENT_DATE
 
-From that split row it extracts:
+It builds LST_UPD_TIME
 
-db_name from element 2,
+It copies WorkItem fields into the target table structure TRADE_PUP_WI_REQ_INTF
 
-user from element 5,
+It adds new fields:
 
-encrypted_password from element 6.
+create_id = 'SYSTEM'
 
-It validates that each of the three values exists; if any is missing, it raises a configuration error (via fail_if_error/force_error) and the branch stops.
+lst_upd_id = 'SYSTEM'
 
-It walks the template lines and replaces:
+ver_num = 0
 
-any line that starts with db_name → db_name: <db_name>
+kyc_shard_num = 3000
 
-any line that starts with user → user: <user>
+batch_id = '202009010053706'
 
-any line that starts with encrypted_password → encrypted_password: <encrypted_password>
+It maps all fields from workitem_req.*
 
-all other lines are passed through unchanged.
+It adds:
 
-Finally, it rejoins the modified lines with newlines to produce the final DBC text for that region.
+transacting_gfcid = in.gfcid
 
-Each branch’s …_dbc File component writes the final DBC to the region-specific path with mode 0666.
 
-ASPAC → $APAC_DBC (file typically named aspac.dbc)
+✅ WorkItem_In is the source of all these fields used in transformation.
 
-NAM → $NAM_DBC (file typically named nam.dbc)
+✅ 5. Target
 
-IDN → $IDN_DBC (file typically named idn.dbc)
+WorkItem_In does not write output.
 
-Targets (outputs)
-Region	Target file variable	What’s in the file
-ASPAC	$APAC_DBC (e.g., aspac.dbc)	The template with db_name, user, encrypted_password replaced by APAC values from kyc_config.csv.
-NAM	$NAM_DBC (e.g., nam.dbc)	The template with those three keys replaced by NAM values.
-IDN	$IDN_DBC (e.g., idn.dbc)	The template with those three keys replaced by IDN values.
+It feeds into LR_File indirectly through the reformat.
 
-All other template lines are preserved verbatim; only the three keys are substituted.
+Final target of the graph is:
 
-One-line overview
+✅ LR_File
 
-The job reads a shared DBC template and a regional CSV catalog, picks the row for the current region, substitutes db_name, user, and encrypted_password into the template, and writes the completed .dbc for ASPAC, NAM, and IDN respectively.
+Writes the final record in a structured file
+
+Metadata included from:
+
+~$AI_DML/kyc_interface_giw_main_table.dml
+
+✅ Summary in Sentence Form (You can paste this in documentation)
+
+The WorkItem_In component reads the Work Item source file defined by the runtime parameter $WI_OUT_FILE, using metadata from kyc_interface_giw_hierarchy_trade_pup.dml. It extracts fields such as gfcid, id_type, batch_dt, client_type, month, year, country, and the nested workitem_req structure. The component performs no transformation and passes all input fields to the downstream mapping (Ref_WI_In_to_TBL), where the Work Item data is reformatted, enriched with system-generated fields, and later written to the LR output file.
